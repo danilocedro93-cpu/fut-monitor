@@ -1,0 +1,4 @@
+anthropic
+feedparser
+beautifulsoup4
+requests
