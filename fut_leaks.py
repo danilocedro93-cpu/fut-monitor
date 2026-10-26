@@ -95,9 +95,15 @@ def clean_text(raw: str) -> str:
 
 
 def _get(url: str, tries: int = 3) -> requests.Response:
-    """GET que espera e tenta de novo quando o site responde 429 (muitas requisicoes)."""
+    """GET com novas tentativas: espera no erro 429 e tenta de novo se a conexao cair."""
+    last_exc = None
     for attempt in range(tries):
-        resp = requests.get(url, headers=HEADERS, timeout=20)
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            time.sleep(3)
+            continue
         if resp.status_code == 429 and attempt < tries - 1:
             try:
                 wait = min(int(resp.headers.get("Retry-After", "5")), 20)
@@ -107,7 +113,7 @@ def _get(url: str, tries: int = 3) -> requests.Response:
             continue
         resp.raise_for_status()
         return resp
-    return resp
+    raise last_exc or RuntimeError(f"falha ao acessar {url}")
 
 
 def fetch_reddit() -> list[dict]:
@@ -133,27 +139,21 @@ def fetch_reddit() -> list[dict]:
 
 def _feed_bytes(page_url: str) -> bytes | None:
     """Abre a pagina; se for um feed, devolve; senao procura o link do feed no HTML."""
-    resp = requests.get(page_url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
+    resp = _get(page_url)
     if "xml" in resp.headers.get("content-type", ""):
         return resp.content
     soup = BeautifulSoup(resp.text, "html.parser")
     for link in soup.find_all("link", rel="alternate"):
         kind = (link.get("type") or "").lower()
         if ("rss" in kind or "atom" in kind) and link.get("href"):
-            feed = requests.get(urljoin(page_url, link["href"]), headers=HEADERS, timeout=20)
-            feed.raise_for_status()
-            return feed.content
+            return _get(urljoin(page_url, link["href"])).content
     # plano B: padrao do WordPress
-    feed = requests.get(page_url.rstrip("/") + "/feed/", headers=HEADERS, timeout=20)
-    feed.raise_for_status()
-    return feed.content
+    return _get(page_url.rstrip("/") + "/feed/").content
 
 
 def _html_listing(name: str, page_url: str) -> list[dict]:
     """Para sites sem RSS: pega os links de artigos da propria pagina de noticias."""
-    resp = requests.get(page_url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
+    resp = _get(page_url)
     soup = BeautifulSoup(resp.text, "html.parser")
     base = urlparse(page_url).path.rstrip("/")  # ex.: /news
     items, seen_urls = [], set()
@@ -204,8 +204,7 @@ def fetch_telegram() -> list[dict]:
     items = []
     for channel in TELEGRAM_CHANNELS:
         try:
-            resp = requests.get(f"https://t.me/s/{channel}", headers=HEADERS, timeout=20)
-            resp.raise_for_status()
+            resp = _get(f"https://t.me/s/{channel}")
             soup = BeautifulSoup(resp.text, "html.parser")
             n_posts = 0
             for msg in soup.select("div.tgme_widget_message"):
@@ -260,12 +259,17 @@ def classify(client, item: dict) -> dict | None:
     try:
         msg = client.messages.create(
             model=MODEL,
-            max_tokens=500,
+            max_tokens=2000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
         )
-        raw = msg.content[0].text
-        return json.loads(re.sub(r"```json|```", "", raw).strip())
+        # a resposta pode ter varios blocos (ex.: raciocinio + texto): juntamos so os de texto
+        raw = "".join(
+            getattr(block, "text", "") for block in msg.content
+            if getattr(block, "type", "") == "text"
+        )
+        start, end = raw.find("{"), raw.rfind("}")
+        return json.loads(raw[start:end + 1])
     except Exception as exc:
         print(f"[aviso] falha ao classificar {item['url']}: {exc}")
         AI_ERRORS.append(f"{type(exc).__name__}: {exc}")
